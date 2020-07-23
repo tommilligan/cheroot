@@ -6,6 +6,7 @@ __metaclass__ = type
 import io
 import os
 import socket
+import threading
 import time
 
 from . import errors
@@ -61,6 +62,7 @@ class ConnectionManager:
                 that uses this ConnectionManager instance.
         """
         self.server = server
+        self._connections_lock = threading.Lock()
         self._selector = selectors.DefaultSelector()
         # Keeps track of the order of connections registered in _selector
         self._fds = []
@@ -75,8 +77,9 @@ class ConnectionManager:
         conn.last_used = time.time()
         conn.ready_with_data = conn.rfile.has_data()
         fileno = conn.socket.fileno()
-        self._selector.register(fileno, selectors.EVENT_READ, data=conn)
-        self._fds.append(fileno)
+        with self._connections_lock:
+            self._selector.register(fileno, selectors.EVENT_READ, data=conn)
+            self._fds.append(fileno)
 
     def expire(self):
         """Expire least recently used connections.
@@ -86,22 +89,28 @@ class ConnectionManager:
 
         This should be called periodically.
         """
-        selector_map = self._selector.get_map()
-        if not selector_map:
-            return
+        with self._connections_lock:
+            selector_map = self._selector.get_map()
+            if not selector_map:
+                return
 
-        # Look at the first connection - if it can be closed, then do
-        # that, and wait for get_conn to return it.
-        conn = selector_map[self._fds[0]].data
-        if conn.closeable:
-            return
+            # Look at the first connection - if it can be closed, then do
+            # that, and wait for get_conn to return it.
+            conn = selector_map[self._fds[0]].data
+            if conn.closeable:
+                return
 
-        # Connection too old?
-        if (conn.last_used + self.server.timeout) < time.time():
-            conn.closeable = True
-            return
+            # Connection too old?
+            if (conn.last_used + self.server.timeout) < time.time():
+                conn.closeable = True
+                return
 
     def get_conn(self, server_socket):
+        """Thread safe _get_conn."""
+        with self._connections_lock:
+            return self._get_conn(server_socket)
+
+    def _get_conn(self, server_socket):
         """Return a HTTPConnection object which is ready to be handled.
 
         A connection returned by this method should be ready for a worker
@@ -131,7 +140,11 @@ class ConnectionManager:
         ss_fileno = server_socket.fileno()
         try:
             self._fds.append(ss_fileno)
-            self._selector.register(ss_fileno, selectors.EVENT_READ, data=server_socket)
+            self._selector.register(
+                ss_fileno,
+                selectors.EVENT_READ,
+                data=server_socket,
+            )
             rlist = [
                 key.fd for key, _event
                 in self._selector.select(timeout=0.1)
@@ -273,14 +286,16 @@ class ConnectionManager:
 
     def close(self):
         """Close all monitored connections."""
-        for fileno, selector_key in dict(self._selector.get_map()).items():
-            selector_key.data.close()
-            self._selector.unregister(fileno)
-        self._selector.close()
-        self._fds = []
+        with self._connections_lock:
+            for fileno, selector_key in dict(self._selector.get_map()).items():
+                selector_key.data.close()
+                self._selector.unregister(fileno)
+            self._selector.close()
+            self._fds = []
 
     @property
     def can_add_keepalive_connection(self):
         """Flag whether it is allowed to add a new keep-alive connection."""
         ka_limit = self.server.keep_alive_conn_limit
-        return ka_limit is None or len(self._fds) < ka_limit
+        with self._connections_lock:
+            return ka_limit is None or len(self._fds) < ka_limit
