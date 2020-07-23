@@ -61,8 +61,9 @@ class ConnectionManager:
                 that uses this ConnectionManager instance.
         """
         self.server = server
-        self.connections = []
         self._selector = selectors.DefaultSelector()
+        # Keeps track of the order of connections registered in _selector
+        self._fds = []
 
     def put(self, conn):
         """Put idle connection into the ConnectionManager to be managed.
@@ -73,7 +74,9 @@ class ConnectionManager:
         """
         conn.last_used = time.time()
         conn.ready_with_data = conn.rfile.has_data()
-        self.connections.append(conn)
+        fileno = conn.socket.fileno()
+        self._selector.register(fileno, selectors.EVENT_READ, data=conn)
+        self._fds.append(fileno)
 
     def expire(self):
         """Expire least recently used connections.
@@ -83,12 +86,13 @@ class ConnectionManager:
 
         This should be called periodically.
         """
-        if not self.connections:
+        selector_map = self._selector.get_map()
+        if not selector_map:
             return
 
         # Look at the first connection - if it can be closed, then do
         # that, and wait for get_conn to return it.
-        conn = self.connections[0]
+        conn = selector_map[self._fds[0]].data
         if conn.closeable:
             return
 
@@ -114,53 +118,41 @@ class ConnectionManager:
             cheroot.server.HTTPConnection instance, or None.
 
         """
-        # Grab file descriptors from sockets, but stop if we find a
-        # connection which is already marked as ready.
-        socket_dict = {}
-        for conn in self.connections:
+        # Stop if we find a connection which is already marked as ready.
+        for fileno in list(self._fds):
+            conn = self._selector.get_key(fileno).data
+            # We have a connection ready for use.
             if conn.closeable or conn.ready_with_data:
-                break
-            socket_dict[conn.socket.fileno()] = conn
-        else:
-            # No ready connection.
-            conn = None
+                self._selector.unregister(fileno)
+                self._fds.remove(fileno)
+                return conn
 
-        # We have a connection ready for use.
-        if conn:
-            self.connections.remove(conn)
-            return conn
-
-        # Will require a select call.
+        # We should also check if the server socket has a new connection
         ss_fileno = server_socket.fileno()
-        socket_dict[ss_fileno] = server_socket
         try:
-            for fno in socket_dict:
-                self._selector.register(fno, selectors.EVENT_READ)
+            self._fds.append(ss_fileno)
+            self._selector.register(ss_fileno, selectors.EVENT_READ, data=server_socket)
             rlist = [
                 key.fd for key, _event
                 in self._selector.select(timeout=0.1)
             ]
         except OSError:
             # Mark any connection which no longer appears valid.
-            for fno, conn in list(socket_dict.items()):
-                # If the server socket is invalid, we'll just ignore it and
-                # wait to be shutdown.
-                if fno == ss_fileno:
-                    continue
+            # We copy the list of connections here as we amend it in place
+            for fileno in list(self._fds):
                 try:
-                    os.fstat(fno)
+                    os.fstat(fileno)
                 except OSError:
-                    # Socket is invalid, close the connection, insert at
-                    # the front.
-                    self.connections.remove(conn)
-                    self.connections.insert(0, conn)
-                    conn.closeable = True
+                    # Socket is invalid, close the connection, move to front
+                    self._fds.remove(fileno)
+                    self._fds.insert(0, fileno)
+                    self._selector.get_key(fileno).data.closeable = True
 
             # Wait for the next tick to occur.
             return None
         finally:
-            for fno in socket_dict:
-                self._selector.unregister(fno)
+            self._fds.remove(ss_fileno)
+            self._selector.unregister(ss_fileno)
 
         try:
             # See if we have a new connection coming in.
@@ -171,20 +163,22 @@ class ConnectionManager:
                 return None
 
             # No new connection, but reuse an existing socket.
-            conn = socket_dict[rlist.pop()]
+            fileno = rlist.pop()
+            conn = self._selector.get_key(fileno).data
+            self._selector.unregister(fileno)
+            self._fds.remove(fileno)
         else:
             # If we have a new connection, reuse the server socket
             conn = server_socket
 
         # All remaining connections in rlist should be marked as ready.
         for fno in rlist:
-            socket_dict[fno].ready_with_data = True
+            self._selector.get_key(fno).data.ready_with_data = True
 
         # New connection.
         if conn is server_socket:
             return self._from_server_socket(server_socket)
 
-        self.connections.remove(conn)
         return conn
 
     def _from_server_socket(self, server_socket):
@@ -279,12 +273,14 @@ class ConnectionManager:
 
     def close(self):
         """Close all monitored connections."""
-        for conn in self.connections[:]:
-            conn.close()
-        self.connections = []
+        for fileno, selector_key in dict(self._selector.get_map()).items():
+            selector_key.data.close()
+            self._selector.unregister(fileno)
+        self._selector.close()
+        self._fds = []
 
     @property
     def can_add_keepalive_connection(self):
         """Flag whether it is allowed to add a new keep-alive connection."""
         ka_limit = self.server.keep_alive_conn_limit
-        return ka_limit is None or len(self.connections) < ka_limit
+        return ka_limit is None or len(self._fds) < ka_limit
